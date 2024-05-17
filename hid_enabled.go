@@ -25,7 +25,8 @@ specifically for the linux platform, below.
 #cgo linux,!android LDFLAGS: -lrt
 
 #cgo darwin CFLAGS: -DOS_DARWIN -DHAVE_SYS_TIME_H
-#cgo darwin LDFLAGS: -framework CoreFoundation -framework IOKit -lobjc
+#cgo darwin LDFLAGS: -lusb-1.0 -liconv
+// #cgo darwin LDFLAGS: -framework CoreFoundation -framework IOKit -lobjc
 
 #cgo windows CFLAGS: -DOS_WINDOWS
 #cgo windows LDFLAGS: -lsetupapi
@@ -60,7 +61,9 @@ specifically for the linux platform, below.
    #include "hidapi/libusb/hid.c"
 
 #elif OS_DARWIN
-	#include "hidapi/mac/hid.c"
+	#include <libusb.h>
+	#include "hidapi/libusb/hid.c"
+	// #include "hidapi/mac/hid.c"
 #elif OS_WINDOWS
 	#include "hidapi/windows/hid.c"
 #elif OS_FREEBSD
