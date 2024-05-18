@@ -109,6 +109,13 @@ struct input_report {
 	struct input_report *next;
 };
 
+struct output_report {
+	IOHIDReportType type;
+	uint8_t *data;
+	size_t len;
+	struct output_report *next;
+};
+
 static struct hid_api_version api_version = {
 	.major = HID_API_VERSION_MAJOR,
 	.minor = HID_API_VERSION_MINOR,
@@ -134,6 +141,11 @@ struct hid_device_ {
 	CFIndex max_input_report_len;
 	struct input_report *input_reports;
 	struct hid_device_info* device_info;
+
+	pthread_t write_thread;
+	struct output_report *write_reports;
+	pthread_mutex_t write_mutex;
+	pthread_cond_t write_condition;
 
 	pthread_t thread;
 	pthread_mutex_t mutex; /* Protects input_reports */
@@ -167,8 +179,12 @@ static hid_device *new_hid_device(void)
 	/* Thread objects */
 	pthread_mutex_init(&dev->mutex, NULL);
 	pthread_cond_init(&dev->condition, NULL);
-	pthread_barrier_init(&dev->barrier, NULL, 2);
-	pthread_barrier_init(&dev->shutdown_barrier, NULL, 2);
+	pthread_barrier_init(&dev->barrier, NULL, 3);
+	pthread_barrier_init(&dev->shutdown_barrier, NULL, 3);
+
+	dev->write_thread = NULL;
+	pthread_mutex_init(&dev->write_mutex, NULL);
+	pthread_cond_init(&dev->write_condition, NULL);
 
 	return dev;
 }
@@ -187,6 +203,14 @@ static void free_hid_device(hid_device *dev)
 		rpt = next;
 	}
 
+	struct output_report *wrpt = dev->write_reports;
+	while (wrpt) {
+		struct output_report *next = wrpt->next;
+		free(wrpt->data);
+		free(wrpt);
+		wrpt = next;
+	}
+
 	/* Free the string and the report buffer. The check for NULL
 	   is necessary here as CFRelease() doesn't handle NULL like
 	   free() and others do. */
@@ -203,6 +227,13 @@ static void free_hid_device(hid_device *dev)
 	pthread_cond_destroy(&dev->condition);
 	pthread_mutex_destroy(&dev->mutex);
 
+
+	pthread_mutex_lock(&dev->write_mutex);
+	pthread_cond_broadcast(&dev->write_condition);
+	pthread_mutex_unlock(&dev->write_mutex);
+
+	pthread_cond_destroy(&dev->write_condition);
+	pthread_mutex_destroy(&dev->write_mutex);
 	/* Free the structure itself. */
 	free(dev);
 }
@@ -989,6 +1020,99 @@ static void *read_thread(void *param)
 	return NULL;
 }
 
+static int write_cond_wait(hid_device *dev, pthread_cond_t *cond, pthread_mutex_t *mutex);
+
+static void *write_thread(void *param)
+{
+	hid_device *dev = (hid_device*) param;
+	SInt32 code;
+
+	pthread_barrier_wait(&dev->barrier);
+
+	while (!dev->shutdown_thread && !dev->disconnected) {
+		int res;
+
+		/* Lock the write mutex */
+		pthread_mutex_lock(&dev->write_mutex);
+		
+		res = write_cond_wait(dev, &dev->write_condition, &dev->write_mutex);
+		if (res == 0) {
+			/* There is data to write. */
+			int bytes_written = 0;
+			struct output_report *rpt = NULL;
+
+			/* Get the first report in the queue */
+			rpt = dev->write_reports;
+
+			if (rpt) {
+				/* Remove the report from the queue */
+				dev->write_reports = rpt->next;
+
+				int report_id = rpt->data[0];
+
+				uint8_t* data_to_send = rpt->data;
+				size_t length_to_send = rpt->len;
+
+				if (report_id == 0x0) {
+					/* Not using numbered Reports.
+					Don't send the report number. */
+					report_id = 66;
+					data_to_send = rpt->data+1;
+					length_to_send = rpt->len-1;
+				}
+
+				/* Write the report */
+				IOReturn res;
+				res = IOHIDDeviceSetReport(dev->device_handle,
+				                                     rpt->type,
+				                                    report_id,
+				                                     data_to_send,
+				                                     length_to_send);
+
+				if (res != kIOReturnSuccess) {
+					register_device_error_format(dev, "IOHIDDeviceSetReport failed: (0x%08X) %s", res, mach_error_string(res));
+					/* Unlock the write mutex */
+
+				/* Free the report */
+				free(rpt->data);
+				free(rpt);
+
+				pthread_mutex_unlock(&dev->write_mutex);
+					continue;
+				}
+
+				/* Free the report */
+				free(rpt->data);
+				free(rpt);
+
+				/* If there was an error, set the error message */
+				if (bytes_written < 0) {
+					register_device_error(dev, "hid_write: error writing to device");
+				}
+			}
+
+		}
+		else {
+			/* There was an error, or a device disconnection. */
+			register_device_error(dev, "hid_write: error waiting for more data");
+		}
+
+		pthread_mutex_unlock(&dev->write_mutex);
+	}
+
+	/* Now that the read thread is stopping, Wake any threads which are
+	   waiting on data (in hid_read_timeout()). Do this under a mutex to
+	   make sure that a thread which is about to go to sleep waiting on
+	   the condition actually will go to sleep before the condition is
+	   signaled. */
+	pthread_mutex_lock(&dev->write_mutex);
+	pthread_cond_broadcast(&dev->write_condition);
+	pthread_mutex_unlock(&dev->write_mutex);
+
+	pthread_barrier_wait(&dev->shutdown_barrier);
+	return NULL;
+}
+
 /* \p path must be one of:
      - in format 'DevSrvsID:<RegistryEntryID>' (as returned by hid_enumerate);
      - a valid path to an IOHIDDevice in the IOService plane (as returned by IORegistryEntryGetPath,
@@ -1077,6 +1201,8 @@ hid_device * HID_API_EXPORT hid_open_path(const char *path)
 	/* Start the read thread */
 	pthread_create(&dev->thread, NULL, read_thread, dev);
 
+	pthread_create(&dev->write_thread, NULL, write_thread, dev);
+
 	/* Wait here for the read thread to be initialized. */
 	pthread_barrier_wait(&dev->barrier);
 
@@ -1108,32 +1234,45 @@ static int set_report(hid_device *dev, IOHIDReportType type, const unsigned char
 		return -1;
 	}
 
-	report_id = data[0];
-
-	if (report_id == 0x0) {
-		/* Not using numbered Reports.
-		   Don't send the report number. */
-		data_to_send = data+1;
-		length_to_send = length-1;
-	}
-
 	/* Avoid crash if the device has been unplugged. */
 	if (dev->disconnected) {
 		register_device_error(dev, "Device is disconnected");
 		return -1;
 	}
 
-	res = IOHIDDeviceSetReport(dev->device_handle,
-	                           type,
-	                           report_id,
-	                           data_to_send, length_to_send);
+	report_id = data[0];
+	pthread_mutex_lock(&dev->write_mutex);
 
-	if (res != kIOReturnSuccess) {
-		register_device_error_format(dev, "IOHIDDeviceSetReport failed: (0x%08X) %s", res, mach_error_string(res));
-		return -1;
+	/* Make a new Input Report object */
+	struct output_report *rpt = (struct output_report*) calloc(1, sizeof(struct output_report));
+	rpt->data = (uint8_t*) calloc(1, length);
+	memcpy(rpt->data, data, length);
+	rpt->len = length;
+	rpt->type = type;
+	rpt->next = NULL;
+
+	/* Attach the new report object to the end of the list. */
+	if (dev->write_reports == NULL) {
+		/* The list is empty. Put it at the root. */
+		dev->write_reports = rpt;
+	}
+	else {
+		/* Find the end of the list and attach. */
+
+		struct output_report *cur = dev->write_reports;
+		while (cur->next != NULL) {
+			cur = cur->next;
+		}
+		cur->next = rpt;
 	}
 
-	return (int) length;
+	/* Signal a waiting thread that there is data. */
+	pthread_cond_signal(&dev->write_condition);
+
+	/* Unlock */
+	pthread_mutex_unlock(&dev->write_mutex);
+
+	return (int) length - data[0] == 0 ? 1 : 0;
 }
 
 static int get_report(hid_device *dev, IOHIDReportType type, unsigned char *data, size_t length)
@@ -1178,6 +1317,27 @@ static int get_report(hid_device *dev, IOHIDReportType type, unsigned char *data
 int HID_API_EXPORT hid_write(hid_device *dev, const unsigned char *data, size_t length)
 {
 	return set_report(dev, kIOHIDReportTypeOutput, data, length);
+}
+
+static int write_cond_wait(hid_device *dev, pthread_cond_t *cond, pthread_mutex_t *mutex)
+{
+	while (!dev->write_reports) {
+		int res = pthread_cond_wait(cond, mutex);
+		if (res != 0)
+			return res;
+
+		/* A res of 0 means we may have been signaled or it may
+		   be a spurious wakeup. Check to see that there's actually
+		   data in the queue before returning, and if not, go back
+		   to sleep. See the pthread_cond_timedwait
+		   */
+
+		if (dev->shutdown_thread || dev->disconnected) {
+			return -1;
+		}
+	}
+
+	return 0;
 }
 
 /* Helper function, so that this isn't duplicated in hid_read(). */
@@ -1297,7 +1457,7 @@ int HID_API_EXPORT hid_read_timeout(hid_device *dev, unsigned char *data, size_t
 			ts.tv_nsec -= 1000000000L;
 		}
 
-		res = cond_timedwait(dev, &dev->condition, &dev->mutex, &ts);
+		res = cond_timedwait(dev, &dev->condition, &dev->mutex, &ts); 
 		if (res == 0) {
 			bytes_read = return_data(dev, data, length);
 		} else if (res == ETIMEDOUT) {
@@ -1351,6 +1511,12 @@ void HID_API_EXPORT hid_close(hid_device *dev)
 	if (!dev)
 		return;
 
+	dev->shutdown_thread = 1;
+
+	pthread_mutex_lock(&dev->write_mutex);
+	pthread_cond_broadcast(&dev->write_condition);
+	pthread_mutex_unlock(&dev->write_mutex);
+
 	/* Disconnect the report callback before close.
 	   See comment below.
 	*/
@@ -1370,11 +1536,19 @@ void HID_API_EXPORT hid_close(hid_device *dev)
 	CFRunLoopSourceSignal(dev->source);
 	CFRunLoopWakeUp(dev->run_loop);
 
+
+
+	pthread_mutex_lock(&dev->write_mutex);
+	pthread_cond_broadcast(&dev->write_condition);
+	pthread_mutex_unlock(&dev->write_mutex);
+
 	/* Notify the read thread that it can shut down now. */
 	pthread_barrier_wait(&dev->shutdown_barrier);
 
 	/* Wait for read_thread() to end. */
 	pthread_join(dev->thread, NULL);
+
+	pthread_join(dev->write_thread, NULL);
 
 	/* Close the OS handle to the device, but only if it's not
 	   been unplugged. If it's been unplugged, then calling
@@ -1395,6 +1569,16 @@ void HID_API_EXPORT hid_close(hid_device *dev)
 		return_data(dev, NULL, 0);
 	}
 	pthread_mutex_unlock(&dev->mutex);
+
+	pthread_mutex_lock(&dev->write_mutex);
+	while (dev->write_reports) {
+		struct output_report *rpt = dev->write_reports;
+		dev->write_reports = rpt->next;
+		free(rpt->data);
+		free(rpt);
+	}
+	pthread_mutex_unlock(&dev->write_mutex);
+
 	CFRelease(dev->device_handle);
 
 	free_hid_device(dev);
